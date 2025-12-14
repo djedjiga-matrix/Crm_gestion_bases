@@ -5,7 +5,7 @@ import {
   ChevronLeft, ChevronRight, X, Check, AlertCircle, Clock,
   MapPin, Phone, Mail, Building, Calendar, TrendingUp,
   Loader2, FileText, BarChart3, Zap, CheckCircle2, Database,
-  Navigation, Play, Pause, MapPinned, Building2, Route, Shield, Map
+  Navigation, Play, Pause, MapPinned, Building2, Route, Shield, Map, Square, Layers
 } from 'lucide-react';
 
 const API_URL = '/api';
@@ -260,9 +260,15 @@ const EnrichmentPage = ({ onComplete, showToast }) => {
   const [loading, setLoading] = useState(false);
   const [currentTask, setCurrentTask] = useState(null);
   const [startPostalCode, setStartPostalCode] = useState('');
-  const [batchSize, setBatchSize] = useState(100);
+  const [batchSize, setBatchSize] = useState(50);
   const [results, setResults] = useState(null);
   const [preview, setPreview] = useState([]);
+
+  // Batch processing state
+  const [progress, setProgress] = useState(null);
+  const [isPaused, setIsPaused] = useState(false);
+  const shouldStopRef = React.useRef(false);
+  const shouldPauseRef = React.useRef(false);
 
   useEffect(() => {
     loadStatus();
@@ -287,49 +293,177 @@ const EnrichmentPage = ({ onComplete, showToast }) => {
     }
   };
 
+  const togglePause = () => {
+    shouldPauseRef.current = !shouldPauseRef.current;
+    setIsPaused(shouldPauseRef.current);
+  };
+
+  const stopEnrichment = () => {
+    shouldStopRef.current = true;
+  };
+
   const runEnrichment = async (type) => {
     setLoading(true);
     setCurrentTask(type);
     setResults(null);
 
+    // Reset control refs
+    shouldStopRef.current = false;
+    shouldPauseRef.current = false;
+    setIsPaused(false);
+
+    // Initialize accumulator for results
+    const accumulatedResults = {
+      total: 0,
+      enriched: 0,
+      geocoded: 0,
+      calculated: 0,
+      not_found: 0,
+      errors: 0,
+      entreprise: { enriched: 0, not_found: 0 },
+      geocode: { geocoded: 0, not_found: 0 },
+      trajets: { calculated: 0, errors: 0 }
+    };
+
+    // Calculate approx total to process for progress bar
+    let totalToProcess = 0;
+    if (status) {
+      if (type === 'entreprise') totalToProcess = parseInt(status.total) - parseInt(status.avec_siret);
+      else if (type === 'geocode') totalToProcess = parseInt(status.total) - parseInt(status.geocodes);
+      else if (type === 'trajets') totalToProcess = parseInt(status.total) - parseInt(status.avec_trajet);
+      else if (type === 'all') totalToProcess = parseInt(status.a_enrichir);
+      else totalToProcess = parseInt(status.total); // default
+    }
+
+    setProgress({
+      current: 0,
+      total: totalToProcess > 0 ? totalToProcess : undefined,
+      startTime: Date.now()
+    });
+
     try {
-      let data;
-      switch (type) {
-        case 'entreprise':
-          data = await api.post('/enrichment/entreprise', { limit: batchSize });
+      let hasMore = true;
+      let consecutiveErrors = 0;
+
+      while (hasMore) {
+        // Check for stop
+        if (shouldStopRef.current) {
+          showToast('Enrichissement arrêté par l\'utilisateur', 'warning');
           break;
-        case 'geocode':
-          data = await api.post('/enrichment/geocode', { limit: batchSize });
-          break;
-        case 'trajets':
-          if (!startPostalCode) {
-            showToast('Veuillez entrer un code postal de départ', 'error');
-            setLoading(false);
-            setCurrentTask(null);
-            return;
+        }
+
+        // Check for pause
+        while (shouldPauseRef.current) {
+          if (shouldStopRef.current) break;
+          await new Promise(r => setTimeout(r, 500));
+        }
+
+        let data;
+        try {
+          switch (type) {
+            case 'entreprise':
+              data = await api.post('/enrichment/entreprise', { limit: batchSize });
+              break;
+            case 'geocode':
+              data = await api.post('/enrichment/geocode', { limit: batchSize });
+              break;
+            case 'trajets':
+              data = await api.post('/enrichment/trajets', { limit: batchSize, startPostalCode });
+              break;
+            case 'all':
+              data = await api.post('/enrichment/all', { limit: batchSize, startPostalCode: startPostalCode || undefined });
+              break;
+            case 'activity':
+              // Activity is usually fast enough in one go, but we keep structure
+              data = await api.post('/enrichment/detect-activity');
+              hasMore = false; // Only run once for activity
+              break;
           }
-          data = await api.post('/enrichment/trajets', { limit: batchSize, startPostalCode });
-          break;
-        case 'all':
-          data = await api.post('/enrichment/all', { limit: batchSize, startPostalCode: startPostalCode || undefined });
-          break;
-        case 'activity':
-          data = await api.post('/enrichment/detect-activity');
-          break;
+          consecutiveErrors = 0; // Reset error count on success
+        } catch (err) {
+          console.error('Batch error:', err);
+          consecutiveErrors++;
+          accumulatedResults.errors += batchSize; // Assume batch failed
+          if (consecutiveErrors > 3) {
+            showToast('Trop d\'erreurs consécutives, arrêt de l\'enrichissement', 'error');
+            break;
+          }
+          await new Promise(r => setTimeout(r, 2000)); // Wait longer on error
+          continue;
+        }
+
+        // Process results
+        const batchRes = data.results;
+
+        // Update accumulated stats
+        if (batchRes) {
+          accumulatedResults.total += (batchRes.total || 0);
+          accumulatedResults.enriched += (batchRes.enriched || 0);
+          accumulatedResults.geocoded += (batchRes.geocoded || 0);
+          accumulatedResults.calculated += (batchRes.calculated || 0);
+          accumulatedResults.not_found += (batchRes.not_found || 0);
+          accumulatedResults.errors += (batchRes.errors || 0);
+
+          // Detailed stats
+          if (batchRes.entreprise) {
+            accumulatedResults.entreprise.enriched += (batchRes.entreprise.enriched || 0);
+            accumulatedResults.entreprise.not_found += (batchRes.entreprise.not_found || 0);
+          }
+          if (batchRes.geocode) {
+            accumulatedResults.geocode.geocoded += (batchRes.geocode.geocoded || 0);
+            accumulatedResults.geocode.not_found += (batchRes.geocode.not_found || 0);
+          }
+          if (batchRes.trajets) {
+            accumulatedResults.trajets.calculated += (batchRes.trajets.calculated || 0);
+            accumulatedResults.trajets.errors += (batchRes.trajets.errors || 0);
+          }
+
+          // Stop condition: if current batch processed 0 items, we are done
+          if (batchRes.total === 0 && type !== 'activity') {
+            hasMore = false;
+          }
+
+          // Allow activity detection to be one-off
+          if (type === 'activity') hasMore = false;
+        }
+
+        // Update progress UI
+        setProgress(prev => {
+          const now = Date.now();
+          const elapsed = (now - prev.startTime) / 1000;
+          const itemsPerSec = accumulatedResults.total / elapsed;
+          const remaining = prev.total ? (prev.total - accumulatedResults.total) : 0;
+          const eta = itemsPerSec > 0 ? Math.ceil(remaining / itemsPerSec) : 0;
+
+          return {
+            ...prev,
+            current: accumulatedResults.total,
+            eta
+          };
+        });
+
+        // Anti-rate limiting pause
+        if (hasMore) {
+          await new Promise(r => setTimeout(r, 1000));
+        }
       }
 
-      setResults(data.results);
-      showToast('Enrichissement terminé !', 'success');
+      setResults(accumulatedResults);
+      if (!shouldStopRef.current) {
+        showToast('Enrichissement terminé !', 'success');
+      }
       loadStatus();
       loadPreview();
       onComplete?.();
+
     } catch (err) {
       console.error('Error running enrichment:', err);
-      showToast('Erreur lors de l\'enrichissement', 'error');
+      showToast('Erreur critique lors de l\'enrichissement', 'error');
     }
 
     setLoading(false);
     setCurrentTask(null);
+    setProgress(null);
   };
 
   return (
@@ -341,6 +475,49 @@ const EnrichmentPage = ({ onComplete, showToast }) => {
         </div>
         <Button onClick={loadStatus} variant="outline" icon={RefreshCw}>Actualiser</Button>
       </div>
+
+      {/* Progress & Control Panel (Visible when enriching) */}
+      {loading && progress && (
+        <Card className="p-6 border-blue-200 bg-blue-50">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-lg font-semibold text-blue-800 flex items-center gap-2">
+              <Loader2 className="w-5 h-5 animate-spin" />
+              Enrichissement en cours...
+            </h3>
+            <div className="flex gap-2">
+              <Button
+                size="sm"
+                variant={isPaused ? "success" : "warning"}
+                onClick={togglePause}
+                icon={isPaused ? Play : Pause}
+              >
+                {isPaused ? "Reprendre" : "Pause"}
+              </Button>
+              <Button
+                size="sm"
+                variant="danger"
+                onClick={stopEnrichment}
+                icon={Square}
+              >
+                Arrêter
+              </Button>
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex justify-between text-sm text-blue-700">
+              <span>Progression: {progress.current} / {progress.total || '?'} contacts</span>
+              {progress.eta > 0 && <span>Temps estimé: ~{Math.floor(progress.eta / 60)}m {progress.eta % 60}s</span>}
+            </div>
+            <div className="w-full bg-blue-200 rounded-full h-3 overflow-hidden">
+              <div
+                className="bg-blue-600 h-full transition-all duration-500 ease-out"
+                style={{ width: `${progress.total ? Math.min(100, (progress.current / progress.total) * 100) : 100}%` }}
+              />
+            </div>
+          </div>
+        </Card>
+      )}
 
       {/* Status Overview */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
@@ -376,12 +553,13 @@ const EnrichmentPage = ({ onComplete, showToast }) => {
             <select
               value={batchSize}
               onChange={(e) => setBatchSize(parseInt(e.target.value))}
+              disabled={loading}
               className="w-full border rounded-lg px-4 py-2 focus:ring-2 focus:ring-blue-500"
             >
               <option value={50}>50 contacts</option>
               <option value={100}>100 contacts</option>
               <option value={200}>200 contacts</option>
-              <option value={500}>500 contacts</option>
+              <option value={500}>500 contacts (Déconseillé)</option>
             </select>
             <p className="text-xs text-gray-500 mt-1">Plus le lot est grand, plus l'enrichissement prend du temps</p>
           </div>
@@ -397,12 +575,9 @@ const EnrichmentPage = ({ onComplete, showToast }) => {
             </div>
             <div>
               <h4 className="font-semibold">Données Entreprise</h4>
-              <p className="text-sm text-gray-500">SIRET, NAF, effectif, dirigeant</p>
+              <p className="text-sm text-gray-500">SIRET, NAF, effectif</p>
             </div>
           </div>
-          <p className="text-xs text-gray-400 mb-4">
-            API Sirene - Recherche par nom + CP
-          </p>
           <Button
             onClick={() => runEnrichment('entreprise')}
             loading={currentTask === 'entreprise'}
@@ -424,9 +599,6 @@ const EnrichmentPage = ({ onComplete, showToast }) => {
               <p className="text-sm text-gray-500">Latitude, longitude</p>
             </div>
           </div>
-          <p className="text-xs text-gray-400 mb-4">
-            API Adresse - Géolocalisation précise
-          </p>
           <Button
             onClick={() => runEnrichment('geocode')}
             loading={currentTask === 'geocode'}
@@ -446,12 +618,9 @@ const EnrichmentPage = ({ onComplete, showToast }) => {
             </div>
             <div>
               <h4 className="font-semibold">Temps de trajet</h4>
-              <p className="text-sm text-gray-500">Distance, durée en voiture</p>
+              <p className="text-sm text-gray-500">Distance, durée</p>
             </div>
           </div>
-          <p className="text-xs text-gray-400 mb-4">
-            API IGN - Itinéraire depuis point de départ
-          </p>
           <Button
             onClick={() => runEnrichment('trajets')}
             loading={currentTask === 'trajets'}
@@ -474,9 +643,6 @@ const EnrichmentPage = ({ onComplete, showToast }) => {
               <p className="text-sm text-gray-500">Tout en une passe</p>
             </div>
           </div>
-          <p className="text-xs text-gray-400 mb-4">
-            Entreprise + Géocodage + Trajets
-          </p>
           <Button
             onClick={() => runEnrichment('all')}
             loading={currentTask === 'all'}
@@ -496,8 +662,7 @@ const EnrichmentPage = ({ onComplete, showToast }) => {
           <div>
             <h3 className="font-semibold">Détection automatique des groupes d'activité</h3>
             <p className="text-sm text-gray-500 mt-1">
-              Classe automatiquement les contacts par secteur (Restauration, BTP, Commerce...)
-              selon leur catégorie et code NAF
+              Classe automatiquement les contacts par secteur (Restauration, BTP...)
             </p>
           </div>
           <Button
@@ -517,74 +682,33 @@ const EnrichmentPage = ({ onComplete, showToast }) => {
         <Card className="p-6">
           <h3 className="font-semibold mb-4 flex items-center gap-2">
             <CheckCircle2 className="w-5 h-5 text-green-500" />
-            Résultats du dernier enrichissement
+            Résultats de l'enrichissement (Session)
           </h3>
 
-          {results.total !== undefined && (
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              <div className="text-center p-4 bg-gray-50 rounded-lg">
-                <div className="text-2xl font-bold">{results.total}</div>
-                <div className="text-sm text-gray-500">Traités</div>
-              </div>
-              {results.enriched !== undefined && (
-                <div className="text-center p-4 bg-green-50 rounded-lg">
-                  <div className="text-2xl font-bold text-green-600">{results.enriched}</div>
-                  <div className="text-sm text-gray-500">Enrichis</div>
-                </div>
-              )}
-              {results.geocoded !== undefined && (
-                <div className="text-center p-4 bg-green-50 rounded-lg">
-                  <div className="text-2xl font-bold text-green-600">{results.geocoded}</div>
-                  <div className="text-sm text-gray-500">Géocodés</div>
-                </div>
-              )}
-              {results.calculated !== undefined && (
-                <div className="text-center p-4 bg-green-50 rounded-lg">
-                  <div className="text-2xl font-bold text-green-600">{results.calculated}</div>
-                  <div className="text-sm text-gray-500">Trajets calculés</div>
-                </div>
-              )}
-              {results.not_found !== undefined && (
-                <div className="text-center p-4 bg-yellow-50 rounded-lg">
-                  <div className="text-2xl font-bold text-yellow-600">{results.not_found}</div>
-                  <div className="text-sm text-gray-500">Non trouvés</div>
-                </div>
-              )}
-              {results.errors !== undefined && (
-                <div className="text-center p-4 bg-red-50 rounded-lg">
-                  <div className="text-2xl font-bold text-red-600">{results.errors}</div>
-                  <div className="text-sm text-gray-500">Erreurs</div>
-                </div>
-              )}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div className="text-center p-4 bg-gray-50 rounded-lg">
+              <div className="text-2xl font-bold">{results.total}</div>
+              <div className="text-sm text-gray-500">Traités</div>
             </div>
-          )}
-
-          {/* Detailed results for "all" enrichment */}
-          {results.entreprise && (
-            <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div className="p-4 border rounded-lg">
-                <h4 className="font-medium mb-2">Entreprises</h4>
-                <p className="text-sm">Enrichis: <span className="font-bold text-green-600">{results.entreprise.enriched}</span></p>
-                <p className="text-sm">Non trouvés: <span className="font-bold text-yellow-600">{results.entreprise.not_found}</span></p>
-              </div>
-              <div className="p-4 border rounded-lg">
-                <h4 className="font-medium mb-2">Géocodage</h4>
-                <p className="text-sm">Géocodés: <span className="font-bold text-green-600">{results.geocode.geocoded}</span></p>
-                <p className="text-sm">Non trouvés: <span className="font-bold text-yellow-600">{results.geocode.not_found}</span></p>
-              </div>
-              <div className="p-4 border rounded-lg">
-                <h4 className="font-medium mb-2">Trajets</h4>
-                <p className="text-sm">Calculés: <span className="font-bold text-green-600">{results.trajets.calculated}</span></p>
-                <p className="text-sm">Erreurs: <span className="font-bold text-red-600">{results.trajets.errors}</span></p>
-              </div>
+            <div className="text-center p-4 bg-green-50 rounded-lg">
+              <div className="text-2xl font-bold text-green-600">{results.enriched + results.geocoded + results.calculated}</div>
+              <div className="text-sm text-gray-500">Succès (cumul)</div>
             </div>
-          )}
+            <div className="text-center p-4 bg-yellow-50 rounded-lg">
+              <div className="text-2xl font-bold text-yellow-600">{results.not_found}</div>
+              <div className="text-sm text-gray-500">Non trouvés</div>
+            </div>
+            <div className="text-center p-4 bg-red-50 rounded-lg">
+              <div className="text-2xl font-bold text-red-600">{results.errors}</div>
+              <div className="text-sm text-gray-500">Erreurs</div>
+            </div>
+          </div>
         </Card>
       )}
 
       {/* Preview */}
       <Card className="p-6">
-        <h3 className="font-semibold mb-4">Aperçu des contacts à enrichir</h3>
+        <h3 className="font-semibold mb-4">Aperçu (5 derniers à enrichir)</h3>
         <div className="overflow-x-auto">
           <table className="min-w-full divide-y divide-gray-200">
             <thead className="bg-gray-50">
@@ -593,8 +717,6 @@ const EnrichmentPage = ({ onComplete, showToast }) => {
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Nom</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">CP / Ville</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">SIRET</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Géoloc</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Trajet</th>
               </tr>
             </thead>
             <tbody className="bg-white divide-y divide-gray-200">
@@ -605,12 +727,6 @@ const EnrichmentPage = ({ onComplete, showToast }) => {
                   <td className="px-4 py-3 text-sm">{contact.code_postal} {contact.ville}</td>
                   <td className="px-4 py-3 text-sm">
                     {contact.siret ? <Badge color="green">✓</Badge> : <Badge color="red">Manquant</Badge>}
-                  </td>
-                  <td className="px-4 py-3 text-sm">
-                    {contact.latitude ? <Badge color="green">✓</Badge> : <Badge color="red">Manquant</Badge>}
-                  </td>
-                  <td className="px-4 py-3 text-sm">
-                    {contact.duree_secondes ? <span>{Math.round(contact.duree_secondes / 60)} min</span> : <Badge color="gray">-</Badge>}
                   </td>
                 </tr>
               ))}
@@ -689,11 +805,31 @@ const ContactsList = ({ showToast }) => {
     }
   };
 
+  const handleSendToStock = async () => {
+    if (selectedContacts.length === 0) return;
+    if (!confirm(`Envoyer ${selectedContacts.length} contacts vers le stock ?`)) return;
+
+    try {
+      const result = await api.post('/stock/import', { contactIds: selectedContacts });
+      showToast(`${result.imported} contacts envoyés au stock`, 'success');
+      setSelectedContacts([]);
+      loadContacts();
+    } catch (err) {
+      console.error('Error sending to stock:', err);
+      showToast('Erreur lors de l\'envoi au stock', 'error');
+    }
+  };
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold">Contacts ({pagination.total?.toLocaleString()})</h1>
         <div className="flex gap-2">
+          {selectedContacts.length > 0 && (
+            <Button onClick={handleSendToStock} variant="primary" icon={Layers}>
+              Vers Stock ({selectedContacts.length})
+            </Button>
+          )}
           <Button onClick={loadContacts} variant="outline" icon={RefreshCw}>Actualiser</Button>
           <Button onClick={() => handleExport('xlsx')} variant="success" icon={Download}>Excel</Button>
           <Button onClick={() => handleExport('csv')} variant="secondary" icon={FileText}>CSV</Button>
@@ -877,6 +1013,21 @@ const ImportPage = ({ onImportComplete, showToast }) => {
     setLoading(false);
   };
 
+  const handleCheckStock = async () => {
+    if (!file) return;
+    setLoading(true);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      const data = await api.post('/stock/check-import-file', formData, true);
+      setResult({ ...result, stockCheck: data });
+      showToast('Vérification terminée', 'success');
+    } catch (err) {
+      showToast('Erreur vérification stock', 'error');
+    }
+    setLoading(false);
+  };
+
   return (
     <div className="space-y-6">
       <h1 className="text-2xl font-bold">Import de fichier</h1>
@@ -924,29 +1075,49 @@ const ImportPage = ({ onImportComplete, showToast }) => {
               ))}
             </div>
           </div>
-          <div className="mt-6 flex justify-end">
+          <div className="flex justify-end gap-3">
+            <Button onClick={handleCheckStock} loading={loading} variant="warning" icon={Shield}>Vérifier doublons Stock</Button>
             <Button onClick={handleImport} loading={loading} icon={Upload}>Importer {analysis.totalRows} lignes</Button>
           </div>
         </Card>
       )}
 
-      {result && (
-        <Card className="p-6">
-          <h3 className="font-semibold mb-4">Résultat de l'import</h3>
-          {result.error ? (
-            <div className="text-red-600 flex items-center"><AlertCircle className="w-5 h-5 mr-2" />{result.error}</div>
-          ) : (
-            <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
-              <div className="text-center p-4 bg-gray-50 rounded-lg"><div className="text-2xl font-bold">{result.total}</div><div className="text-sm text-gray-500">Total</div></div>
-              <div className="text-center p-4 bg-green-50 rounded-lg"><div className="text-2xl font-bold text-green-600">{result.imported}</div><div className="text-sm text-gray-500">Importés</div></div>
-              <div className="text-center p-4 bg-blue-50 rounded-lg"><div className="text-2xl font-bold text-blue-600">{result.updated}</div><div className="text-sm text-gray-500">Mis à jour</div></div>
-              <div className="text-center p-4 bg-yellow-50 rounded-lg"><div className="text-2xl font-bold text-yellow-600">{result.duplicates}</div><div className="text-sm text-gray-500">Doublons</div></div>
-              <div className="text-center p-4 bg-red-50 rounded-lg"><div className="text-2xl font-bold text-red-600">{result.errors}</div><div className="text-sm text-gray-500">Erreurs</div></div>
+      {result?.stockCheck && (
+        <Card className="p-6 border-l-4 border-yellow-400">
+          <h3 className="font-semibold text-yellow-800 mb-2">Rapport Pré-Import (Stock)</h3>
+          <div className="flex gap-6 text-sm">
+            <div>Total fichier: <strong>{result.stockCheck.total}</strong></div>
+            <div className="text-green-600">Nouveaux: <strong>{result.stockCheck.newCount}</strong></div>
+            <div className="text-red-600">Doublons Stock: <strong>{result.stockCheck.duplicatesCount}</strong></div>
+          </div>
+          {result.stockCheck.sampleDuplicates?.length > 0 && (
+            <div className="mt-2 text-xs text-gray-500">
+              Exemple de doublons: {result.stockCheck.sampleDuplicates.map(d => `${d.nom} (${d.reason})`).join(', ')}...
             </div>
           )}
         </Card>
-      )}
-    </div>
+      )
+      }
+
+      {
+        result && (
+          <Card className="p-6">
+            <h3 className="font-semibold mb-4">Résultat de l'import</h3>
+            {result.error ? (
+              <div className="text-red-600 flex items-center"><AlertCircle className="w-5 h-5 mr-2" />{result.error}</div>
+            ) : (
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+                <div className="text-center p-4 bg-gray-50 rounded-lg"><div className="text-2xl font-bold">{result.total}</div><div className="text-sm text-gray-500">Total</div></div>
+                <div className="text-center p-4 bg-green-50 rounded-lg"><div className="text-2xl font-bold text-green-600">{result.imported}</div><div className="text-sm text-gray-500">Importés</div></div>
+                <div className="text-center p-4 bg-blue-50 rounded-lg"><div className="text-2xl font-bold text-blue-600">{result.updated}</div><div className="text-sm text-gray-500">Mis à jour</div></div>
+                <div className="text-center p-4 bg-yellow-50 rounded-lg"><div className="text-2xl font-bold text-yellow-600">{result.duplicates}</div><div className="text-sm text-gray-500">Doublons</div></div>
+                <div className="text-center p-4 bg-red-50 rounded-lg"><div className="text-2xl font-bold text-red-600">{result.errors}</div><div className="text-sm text-gray-500">Erreurs</div></div>
+              </div>
+            )}
+          </Card>
+        )
+      }
+    </div >
   );
 };
 
@@ -1169,6 +1340,1014 @@ const AuthorizedCpPage = ({ showToast, onUpdate }) => {
 };
 
 // ============================================
+// Stock Page Component
+// ============================================
+const StockPage = ({ showToast, onUpdate }) => {
+  const [data, setData] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [stats, setStats] = useState(null);
+  const [pagination, setPagination] = useState({ page: 1, total: 0, totalPages: 0 });
+  const [filters, setFilters] = useState({
+    search: '', departement: '', activityGroup: '', statut: '',
+    smallBusiness: false, authorizedOnly: false,
+  });
+  const [selected, setSelected] = useState([]);
+  const [activityGroups, setActivityGroups] = useState([]);
+  const [showImportModal, setShowImportModal] = useState(false);
+
+  // Import config
+  const [importConfig, setImportConfig] = useState({
+    useAuthorizedCp: true,
+    codesNaf: '',
+    effectifTPE: true,
+    limit: 1000,
+  });
+
+  useEffect(() => {
+    loadData();
+    loadStats();
+    api.get('/reference/activity-groups').then(setActivityGroups).catch(console.error);
+  }, []);
+
+  useEffect(() => { loadData(); }, [pagination.page, filters]);
+
+  const loadData = async () => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({
+        page: pagination.page, limit: 50,
+        ...(filters.search && { search: filters.search }),
+        ...(filters.departement && { departement: filters.departement }),
+        ...(filters.activityGroup && { activityGroup: filters.activityGroup }),
+        ...(filters.statut && { statut: filters.statut }),
+        ...(filters.smallBusiness && { smallBusiness: 'true' }),
+        ...(filters.authorizedOnly && { authorizedOnly: 'true' }),
+      });
+      const result = await api.get(`/stock?${params}`);
+      setData(result.data);
+      setPagination(result.pagination);
+    } catch (err) {
+      console.error(err);
+    }
+    setLoading(false);
+  };
+
+  const loadStats = async () => {
+    try {
+      const result = await api.get('/stock/stats');
+      setStats(result);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleImportFromSirene = async () => {
+    setLoading(true);
+    try {
+      const payload = {
+        codesPostaux: importConfig.useAuthorizedCp ? 'authorized' : null,
+        codesNaf: importConfig.codesNaf ? importConfig.codesNaf.split(',').map(n => n.trim()) : null,
+        tranchesEffectifs: importConfig.effectifTPE ? ['NN', '00', '01', '02', '03', '11'] : null,
+        limit: importConfig.limit,
+      };
+      const result = await api.post('/stock/import-from-sirene', payload);
+      showToast(`${result.imported} entreprises importées dans le stock`, 'success');
+      setShowImportModal(false);
+      loadData();
+      loadStats();
+    } catch (err) {
+      showToast('Erreur: ' + err.message, 'error');
+    }
+    setLoading(false);
+  };
+
+  const handleTransferToContacts = async () => {
+    if (selected.length === 0) {
+      showToast('Sélectionnez des entreprises', 'warning');
+      return;
+    }
+    if (!confirm(`Transférer ${selected.length} entreprises vers Contacts ?`)) return;
+
+    setLoading(true);
+    try {
+      const result = await api.post('/stock/transfer-to-contacts', { ids: selected });
+      showToast(`${result.transferred} contacts créés`, 'success');
+      setSelected([]);
+      loadData();
+      loadStats();
+      onUpdate?.();
+    } catch (err) {
+      showToast('Erreur', 'error');
+    }
+    setLoading(false);
+  };
+
+  const handleBulkStatus = async (newStatus) => {
+    if (selected.length === 0) return;
+    try {
+      await api.put('/stock/bulk-status', { ids: selected, statut: newStatus });
+      showToast('Statut mis à jour', 'success');
+      setSelected([]);
+      loadData();
+    } catch (err) {
+      showToast('Erreur', 'error');
+    }
+  };
+
+  const toggleSelect = (id) => {
+    setSelected(prev => prev.includes(id) ? prev.filter(i => i !== id) : [...prev, id]);
+  };
+
+  const toggleSelectAll = () => {
+    if (selected.length === data.length) {
+      setSelected([]);
+    } else {
+      setSelected(data.map(d => d.id));
+    }
+  };
+
+  const statuts = [
+    { value: 'nouveau', label: 'Nouveau', color: 'gray' },
+    { value: 'a_contacter', label: 'À contacter', color: 'blue' },
+    { value: 'contacte', label: 'Contacté', color: 'yellow' },
+    { value: 'interesse', label: 'Intéressé', color: 'green' },
+    { value: 'pas_interesse', label: 'Pas intéressé', color: 'red' },
+  ];
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-bold">Stock Centralisé</h1>
+          <p className="text-gray-500">Base consolidée et dédoublonnée</p>
+        </div>
+        <div className="flex gap-2">
+          <Button onClick={() => setShowImportModal(true)} variant="primary" icon={Plus}>
+            Importer depuis SIRENE
+          </Button>
+          <Button onClick={loadData} variant="outline" icon={RefreshCw}>Actualiser</Button>
+        </div>
+      </div>
+
+      {/* Stats */}
+      {stats && (
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+          <StatCard title="Total stock" value={stats.total} icon={Database} color="blue" />
+          <StatCard title="TPE" value={stats.tpe} icon={Building} color="green" />
+          <StatCard title="Nouveaux" value={stats.nouveaux} icon={Plus} color="gray" />
+          <StatCard title="Intéressés" value={stats.interesses} icon={Target} color="purple" />
+          <StatCard title="Transférés" value={stats.transferes} icon={Users} color="orange" />
+        </div>
+      )}
+
+      {/* Actions sur sélection */}
+      {selected.length > 0 && (
+        <Card className="p-4 bg-blue-50 border-blue-200">
+          <div className="flex items-center justify-between">
+            <span className="font-medium">{selected.length} sélectionné(s)</span>
+            <div className="flex gap-2">
+              <Button onClick={handleTransferToContacts} variant="success" size="sm" icon={Users}>
+                Transférer vers Contacts
+              </Button>
+              <select
+                onChange={(e) => { if (e.target.value) handleBulkStatus(e.target.value); e.target.value = ''; }}
+                className="border rounded-lg px-3 py-1 text-sm"
+              >
+                <option value="">Changer statut...</option>
+                {statuts.map(s => <option key={s.value} value={s.value}>{s.label}</option>)}
+              </select>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {/* Filtres */}
+      <Card className="p-4">
+        <div className="grid grid-cols-2 md:grid-cols-6 gap-4">
+          <div className="md:col-span-2 relative">
+            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400" />
+            <input
+              type="text"
+              placeholder="Rechercher..."
+              value={filters.search}
+              onChange={(e) => setFilters(p => ({ ...p, search: e.target.value }))}
+              className="w-full pl-10 pr-4 py-2 border rounded-lg"
+            />
+          </div>
+          <select
+            value={filters.departement}
+            onChange={(e) => setFilters(p => ({ ...p, departement: e.target.value }))}
+            className="border rounded-lg px-3 py-2"
+          >
+            <option value="">Département</option>
+            <option value="59">59 - Nord</option>
+            <option value="35">35 - Ille-et-Vilaine</option>
+          </select>
+          <select
+            value={filters.activityGroup}
+            onChange={(e) => setFilters(p => ({ ...p, activityGroup: e.target.value }))}
+            className="border rounded-lg px-3 py-2"
+          >
+            <option value="">Activité</option>
+            {activityGroups.map(g => <option key={g.code} value={g.code}>{g.nom}</option>)}
+          </select>
+          <select
+            value={filters.statut}
+            onChange={(e) => setFilters(p => ({ ...p, statut: e.target.value }))}
+            className="border rounded-lg px-3 py-2"
+          >
+            <option value="">Statut</option>
+            {statuts.map(s => <option key={s.value} value={s.value}>{s.label}</option>)}
+          </select>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={filters.smallBusiness}
+              onChange={(e) => setFilters(p => ({ ...p, smallBusiness: e.target.checked }))}
+              className="w-4 h-4"
+            />
+            <span className="text-sm">TPE</span>
+          </label>
+        </div>
+      </Card>
+
+      {/* Table */}
+      <Card>
+        <div className="overflow-x-auto">
+          <table className="min-w-full divide-y divide-gray-200">
+            <thead className="bg-gray-50">
+              <tr>
+                <th className="px-4 py-3">
+                  <input type="checkbox" checked={selected.length === data.length && data.length > 0}
+                    onChange={toggleSelectAll} className="w-4 h-4" />
+                </th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Entreprise</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Localisation</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Contact</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">SIRET</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Statut</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-200">
+              {loading ? (
+                <tr><td colSpan="6" className="px-4 py-8 text-center">
+                  <Loader2 className="w-8 h-8 animate-spin mx-auto text-blue-500" />
+                </td></tr>
+              ) : data.length === 0 ? (
+                <tr><td colSpan="6" className="px-4 py-8 text-center text-gray-500">Vide</td></tr>
+              ) : data.map(row => (
+                <tr key={row.id} className={`hover:bg-gray-50 ${selected.includes(row.id) ? 'bg-blue-50' : ''}`}>
+                  <td className="px-4 py-3">
+                    <input type="checkbox" checked={selected.includes(row.id)}
+                      onChange={() => toggleSelect(row.id)} className="w-4 h-4" />
+                  </td>
+                  <td className="px-4 py-3">
+                    <div className="font-medium">{row.nom || row.enseigne}</div>
+                    {row.groupe_code && <Badge color="purple">{row.groupe_code}</Badge>}
+                    {row.is_small_business && <Badge color="green">TPE</Badge>}
+                  </td>
+                  <td className="px-4 py-3">
+                    <div className="text-sm">{row.code_postal} {row.ville}</div>
+                  </td>
+                  <td className="px-4 py-3">
+                    {row.telephone ? (
+                      <div className="flex items-center text-sm"><Phone className="w-3 h-3 mr-1" />{row.telephone}</div>
+                    ) : <span className="text-gray-400">-</span>}
+                  </td>
+                  <td className="px-4 py-3 font-mono text-sm">{row.siret}</td>
+                  <td className="px-4 py-3">
+                    <Badge color={statuts.find(s => s.value === row.statut)?.color || 'gray'}>
+                      {statuts.find(s => s.value === row.statut)?.label || row.statut}
+                    </Badge>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div className="flex items-center justify-between px-4 py-3 border-t">
+          <div className="text-sm text-gray-500">
+            Page {pagination.page} sur {pagination.totalPages} ({pagination.total} résultats)
+          </div>
+          <div className="flex gap-2">
+            <Button onClick={() => setPagination(p => ({ ...p, page: p.page - 1 }))}
+              disabled={pagination.page <= 1} variant="outline" size="sm"><ChevronLeft className="w-4 h-4" /></Button>
+            <Button onClick={() => setPagination(p => ({ ...p, page: p.page + 1 }))}
+              disabled={pagination.page >= pagination.totalPages} variant="outline" size="sm"><ChevronRight className="w-4 h-4" /></Button>
+          </div>
+        </div>
+      </Card>
+
+      {/* Modal Import */}
+      {showImportModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <Card className="w-full max-w-lg p-6">
+            <h3 className="text-lg font-bold mb-4">Importer depuis Base SIRENE</h3>
+
+            <div className="space-y-4">
+              <label className="flex items-center gap-3 p-3 border rounded-lg">
+                <input type="checkbox" checked={importConfig.useAuthorizedCp}
+                  onChange={(e) => setImportConfig(p => ({ ...p, useAuthorizedCp: e.target.checked }))}
+                  className="w-5 h-5" />
+                <div>
+                  <div className="font-medium">Uniquement mes CP autorisés</div>
+                  <div className="text-sm text-gray-500">Filtre automatique sur vos zones</div>
+                </div>
+              </label>
+
+              <div>
+                <label className="block text-sm font-medium mb-1">Codes NAF (optionnel)</label>
+                <input type="text" value={importConfig.codesNaf}
+                  onChange={(e) => setImportConfig(p => ({ ...p, codesNaf: e.target.value }))}
+                  placeholder="56.10, 43.21, 96.02..."
+                  className="w-full border rounded-lg px-4 py-2" />
+              </div>
+
+              <label className="flex items-center gap-3 p-3 border rounded-lg">
+                <input type="checkbox" checked={importConfig.effectifTPE}
+                  onChange={(e) => setImportConfig(p => ({ ...p, effectifTPE: e.target.checked }))}
+                  className="w-5 h-5" />
+                <div>
+                  <div className="font-medium">TPE uniquement (&lt; 20 salariés)</div>
+                </div>
+              </label>
+
+              <div>
+                <label className="block text-sm font-medium mb-1">Limite</label>
+                <select value={importConfig.limit}
+                  onChange={(e) => setImportConfig(p => ({ ...p, limit: parseInt(e.target.value) }))}
+                  className="w-full border rounded-lg px-4 py-2">
+                  <option value={500}>500 entreprises</option>
+                  <option value={1000}>1 000 entreprises</option>
+                  <option value={2500}>2 500 entreprises</option>
+                  <option value={5000}>5 000 entreprises</option>
+                </select>
+              </div>
+            </div>
+
+            <div className="flex gap-4 mt-6">
+              <Button onClick={() => setShowImportModal(false)} variant="outline" className="flex-1">Annuler</Button>
+              <Button onClick={handleImportFromSirene} loading={loading} className="flex-1">Importer</Button>
+            </div>
+          </Card>
+        </div>
+      )}
+    </div>
+  );
+};
+
+
+// ============================================
+// Sirene Page
+// ============================================
+const SirenePage = ({ showToast, onUpdate }) => {
+  const [status, setStatus] = useState(null);
+  const [imports, setImports] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [activeTab, setActiveTab] = useState('status'); // status, import, generate, search
+
+  // Import
+  const [importPath, setImportPath] = useState('/home/claude/sirene/StockEtablissement_utf8.csv');
+  const [importMode, setImportMode] = useState('full');
+  const [importDepts, setImportDepts] = useState('');
+  const [currentImport, setCurrentImport] = useState(null);
+
+  // Génération
+  const [genConfig, setGenConfig] = useState({
+    useAuthorizedCp: true,
+    codesPostaux: '',
+    codesNaf: '',
+    effectifTPE: true,
+    actifUniquement: true,
+    siegeUniquement: false,
+    limit: 500,
+    injectInContacts: false,
+  });
+  const [genResult, setGenResult] = useState(null);
+  const [genPreview, setGenPreview] = useState([]);
+
+  // Recherche
+  const [searchParams, setSearchParams] = useState({
+    q: '', siret: '', cp: '', departement: '', naf: ''
+  });
+  const [searchResults, setSearchResults] = useState({ total: 0, data: [] });
+
+  useEffect(() => {
+    loadStatus();
+    loadImports();
+  }, []);
+
+  // Polling pour suivre l'import en cours
+  useEffect(() => {
+    if (currentImport && currentImport.status === 'running') {
+      const interval = setInterval(async () => {
+        try {
+          const data = await api.get(`/sirene/import/${currentImport.id}`);
+          setCurrentImport(data);
+          if (data.status !== 'running') {
+            clearInterval(interval);
+            loadStatus();
+            loadImports();
+            showToast('Import terminé !', 'success');
+          }
+        } catch (err) {
+          console.error(err);
+        }
+      }, 5000);
+      return () => clearInterval(interval);
+    }
+  }, [currentImport]);
+
+  const loadStatus = async () => {
+    try {
+      const data = await api.get('/sirene/status');
+      setStatus(data);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const loadImports = async () => {
+    try {
+      const data = await api.get('/sirene/imports');
+      setImports(data);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const startImport = async () => {
+    if (!importPath) {
+      showToast('Chemin du fichier requis', 'error');
+      return;
+    }
+    setLoading(true);
+    try {
+      const depts = importDepts ? importDepts.split(',').map(d => d.trim()) : null;
+      const result = await api.post('/sirene/import', {
+        filepath: importPath,
+        mode: importMode,
+        departements: depts
+      });
+      setCurrentImport({ id: result.importId, status: 'running', imported_rows: 0 });
+      showToast('Import lancé !', 'success');
+    } catch (err) {
+      showToast('Erreur: ' + err.message, 'error');
+    }
+    setLoading(false);
+  };
+
+  const generatePreview = async () => {
+    setLoading(true);
+    try {
+      const payload = buildGeneratePayload(false);
+      payload.limit = 20; // Preview limité
+      const result = await api.post('/sirene/generate', payload);
+      setGenPreview(result.data || []);
+      setGenResult({ found: result.total, preview: true });
+    } catch (err) {
+      showToast('Erreur: ' + err.message, 'error');
+    }
+    setLoading(false);
+  };
+
+  const generateAndInject = async () => {
+    if (!confirm(`Injecter jusqu'à ${genConfig.limit} contacts dans la base ?`)) return;
+    setLoading(true);
+    try {
+      const payload = buildGeneratePayload(true);
+      const result = await api.post('/sirene/generate', payload);
+      setGenResult(result);
+      showToast(`${result.injected} contacts injectés !`, 'success');
+      onUpdate?.();
+    } catch (err) {
+      showToast('Erreur: ' + err.message, 'error');
+    }
+    setLoading(false);
+  };
+
+  const buildGeneratePayload = (inject) => {
+    const payload = {
+      actifUniquement: genConfig.actifUniquement,
+      siegeUniquement: genConfig.siegeUniquement,
+      limit: genConfig.limit,
+      injectInContacts: inject
+    };
+
+    if (genConfig.useAuthorizedCp) {
+      payload.codesPostaux = 'authorized';
+    } else if (genConfig.codesPostaux) {
+      payload.codesPostaux = genConfig.codesPostaux.split(',').map(cp => cp.trim());
+    }
+
+    if (genConfig.codesNaf) {
+      payload.codesNaf = genConfig.codesNaf.split(',').map(naf => naf.trim());
+    }
+
+    if (genConfig.effectifTPE) {
+      payload.tranchesEffectifs = ['NN', '00', '01', '02', '03', '11'];
+    }
+
+    return payload;
+  };
+
+  const doSearch = async () => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams();
+      Object.entries(searchParams).forEach(([k, v]) => {
+        if (v) params.append(k, v);
+      });
+      params.append('limit', '50');
+      params.append('actif', 'true');
+
+      const result = await api.get(`/sirene/search?${params}`);
+      setSearchResults(result);
+    } catch (err) {
+      showToast('Erreur: ' + err.message, 'error');
+    }
+    setLoading(false);
+  };
+
+  const formatNumber = (n) => n?.toLocaleString() || '0';
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-bold">Base SIRENE</h1>
+          <p className="text-gray-500">Base nationale des entreprises (data.gouv.fr)</p>
+        </div>
+        <Button onClick={loadStatus} variant="outline" icon={RefreshCw}>Actualiser</Button>
+      </div>
+
+      {/* Tabs */}
+      <div className="flex gap-2 border-b">
+        {[
+          { id: 'status', label: 'État', icon: Database },
+          { id: 'import', label: 'Import CSV', icon: Upload },
+          { id: 'generate', label: 'Générer base', icon: Zap },
+          { id: 'search', label: 'Rechercher', icon: Search },
+        ].map(tab => (
+          <button
+            key={tab.id}
+            onClick={() => setActiveTab(tab.id)}
+            className={`flex items-center gap-2 px-4 py-3 border-b-2 transition-colors ${activeTab === tab.id
+              ? 'border-blue-500 text-blue-600'
+              : 'border-transparent text-gray-500 hover:text-gray-700'
+              }`}
+          >
+            <tab.icon className="w-4 h-4" />
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Tab: Status */}
+      {activeTab === 'status' && (
+        <div className="space-y-6">
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+            <StatCard title="Total établissements" value={formatNumber(status?.total)} icon={Database} color="blue" />
+            <StatCard title="Actifs" value={formatNumber(status?.actifs)} icon={CheckCircle2} color="green" />
+            <StatCard title="Fermés" value={formatNumber(status?.fermes)} icon={X} color="red" />
+            <StatCard title="Codes postaux" value={formatNumber(status?.nb_cp)} icon={MapPin} color="purple" />
+            <StatCard title="Départements" value={formatNumber(status?.nb_dept)} icon={Map} color="orange" />
+          </div>
+
+          {status?.lastImport && (
+            <Card className="p-6">
+              <h3 className="font-semibold mb-4">Dernier import</h3>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div>
+                  <p className="text-sm text-gray-500">Fichier</p>
+                  <p className="font-medium">{status.lastImport.filename}</p>
+                </div>
+                <div>
+                  <p className="text-sm text-gray-500">Statut</p>
+                  <Badge color={status.lastImport.status === 'completed' ? 'green' : 'yellow'}>
+                    {status.lastImport.status}
+                  </Badge>
+                </div>
+                <div>
+                  <p className="text-sm text-gray-500">Lignes importées</p>
+                  <p className="font-medium">{formatNumber(status.lastImport.imported_rows)}</p>
+                </div>
+                <div>
+                  <p className="text-sm text-gray-500">Date</p>
+                  <p className="font-medium">
+                    {status.lastImport.completed_at
+                      ? new Date(status.lastImport.completed_at).toLocaleDateString('fr-FR')
+                      : '-'}
+                  </p>
+                </div>
+              </div>
+            </Card>
+          )}
+
+          {imports.length > 0 && (
+            <Card className="p-6">
+              <h3 className="font-semibold mb-4">Historique des imports</h3>
+              <table className="min-w-full divide-y divide-gray-200">
+                <thead className="bg-gray-50">
+                  <tr>
+                    <th className="px-4 py-2 text-left text-xs font-medium text-gray-500">Fichier</th>
+                    <th className="px-4 py-2 text-left text-xs font-medium text-gray-500">Statut</th>
+                    <th className="px-4 py-2 text-left text-xs font-medium text-gray-500">Importés</th>
+                    <th className="px-4 py-2 text-left text-xs font-medium text-gray-500">Erreurs</th>
+                    <th className="px-4 py-2 text-left text-xs font-medium text-gray-500">Date</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-200">
+                  {imports.map(imp => (
+                    <tr key={imp.id}>
+                      <td className="px-4 py-2 text-sm">{imp.filename}</td>
+                      <td className="px-4 py-2">
+                        <Badge color={imp.status === 'completed' ? 'green' : imp.status === 'running' ? 'yellow' : 'red'}>
+                          {imp.status}
+                        </Badge>
+                      </td>
+                      <td className="px-4 py-2 text-sm">{formatNumber(imp.imported_rows)}</td>
+                      <td className="px-4 py-2 text-sm">{imp.errors || 0}</td>
+                      <td className="px-4 py-2 text-sm">
+                        {new Date(imp.created_at).toLocaleDateString('fr-FR')}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </Card>
+          )}
+        </div>
+      )}
+
+      {/* Tab: Import */}
+      {activeTab === 'import' && (
+        <div className="space-y-6">
+          <Card className="p-6">
+            <h3 className="font-semibold mb-4">Importer le fichier CSV SIRENE</h3>
+
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium mb-2">Chemin du fichier sur le serveur</label>
+                <input
+                  type="text"
+                  value={importPath}
+                  onChange={(e) => setImportPath(e.target.value)}
+                  placeholder="/chemin/vers/StockEtablissement_utf8.csv"
+                  className="w-full border rounded-lg px-4 py-2"
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  Téléchargez d'abord le fichier depuis data.gouv.fr sur votre serveur
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium mb-2">Mode d'import</label>
+                <div className="flex gap-4">
+                  {[
+                    { value: 'full', label: 'Complet', desc: 'Vide la table et réimporte tout' },
+                    { value: 'update', label: 'Mise à jour', desc: 'Met à jour les existants, ajoute les nouveaux' },
+                    { value: 'departements', label: 'Par départements', desc: 'Importe uniquement certains départements' },
+                  ].map(opt => (
+                    <label key={opt.value} className={`flex-1 p-4 border rounded-lg cursor-pointer ${importMode === opt.value ? 'border-blue-500 bg-blue-50' : 'hover:bg-gray-50'
+                      }`}>
+                      <input
+                        type="radio"
+                        name="importMode"
+                        value={opt.value}
+                        checked={importMode === opt.value}
+                        onChange={(e) => setImportMode(e.target.value)}
+                        className="sr-only"
+                      />
+                      <div className="font-medium">{opt.label}</div>
+                      <div className="text-xs text-gray-500">{opt.desc}</div>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              {importMode === 'departements' && (
+                <div>
+                  <label className="block text-sm font-medium mb-2">Départements à importer</label>
+                  <input
+                    type="text"
+                    value={importDepts}
+                    onChange={(e) => setImportDepts(e.target.value)}
+                    placeholder="59, 35, 62..."
+                    className="w-full border rounded-lg px-4 py-2"
+                  />
+                </div>
+              )}
+
+              <div className="bg-yellow-50 p-4 rounded-lg">
+                <p className="text-sm text-yellow-800">
+                  <strong>⚠️ Attention :</strong> L'import complet de 8 Go peut prendre 1-2 heures.
+                  L'import par départements est beaucoup plus rapide.
+                </p>
+              </div>
+
+              <Button onClick={startImport} loading={loading} icon={Upload} className="w-full">
+                Lancer l'import
+              </Button>
+            </div>
+          </Card>
+
+          {/* Import en cours */}
+          {currentImport && currentImport.status === 'running' && (
+            <Card className="p-6 border-blue-200 bg-blue-50">
+              <div className="flex items-center gap-4">
+                <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
+                <div>
+                  <h3 className="font-semibold">Import en cours...</h3>
+                  <p className="text-sm text-gray-600">
+                    {formatNumber(currentImport.imported_rows)} lignes importées
+                  </p>
+                </div>
+              </div>
+            </Card>
+          )}
+        </div>
+      )}
+
+      {/* Tab: Generate */}
+      {activeTab === 'generate' && (
+        <div className="space-y-6">
+          <Card className="p-6">
+            <h3 className="font-semibold mb-4">Générer une base de prospection</h3>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              {/* Filtres géographiques */}
+              <div className="space-y-4">
+                <h4 className="font-medium text-gray-700">📍 Zone géographique</h4>
+
+                <label className="flex items-center gap-3 p-3 border rounded-lg cursor-pointer hover:bg-gray-50">
+                  <input
+                    type="checkbox"
+                    checked={genConfig.useAuthorizedCp}
+                    onChange={(e) => setGenConfig(p => ({ ...p, useAuthorizedCp: e.target.checked }))}
+                    className="w-5 h-5"
+                  />
+                  <div>
+                    <div className="font-medium">Utiliser mes CP autorisés</div>
+                    <div className="text-sm text-gray-500">Filtre automatique sur vos zones</div>
+                  </div>
+                </label>
+
+                {!genConfig.useAuthorizedCp && (
+                  <div>
+                    <label className="block text-sm font-medium mb-1">Codes postaux spécifiques</label>
+                    <input
+                      type="text"
+                      value={genConfig.codesPostaux}
+                      onChange={(e) => setGenConfig(p => ({ ...p, codesPostaux: e.target.value }))}
+                      placeholder="59000, 59100, 59200..."
+                      className="w-full border rounded-lg px-4 py-2"
+                    />
+                  </div>
+                )}
+              </div>
+
+              {/* Filtres secteur */}
+              <div className="space-y-4">
+                <h4 className="font-medium text-gray-700">🏢 Secteur d'activité</h4>
+
+                <div>
+                  <label className="block text-sm font-medium mb-1">Codes NAF</label>
+                  <input
+                    type="text"
+                    value={genConfig.codesNaf}
+                    onChange={(e) => setGenConfig(p => ({ ...p, codesNaf: e.target.value }))}
+                    placeholder="56.10, 43.21, 96.02..."
+                    className="w-full border rounded-lg px-4 py-2"
+                  />
+                  <p className="text-xs text-gray-500 mt-1">
+                    56 = Restauration, 43 = BTP, 96 = Services personnels...
+                  </p>
+                </div>
+              </div>
+
+              {/* Filtres entreprise */}
+              <div className="space-y-4">
+                <h4 className="font-medium text-gray-700">👥 Type d'entreprise</h4>
+
+                <label className="flex items-center gap-3 p-3 border rounded-lg cursor-pointer hover:bg-gray-50">
+                  <input
+                    type="checkbox"
+                    checked={genConfig.effectifTPE}
+                    onChange={(e) => setGenConfig(p => ({ ...p, effectifTPE: e.target.checked }))}
+                    className="w-5 h-5"
+                  />
+                  <div>
+                    <div className="font-medium">TPE uniquement (&lt; 20 salariés)</div>
+                    <div className="text-sm text-gray-500">Cible idéale SFR Pro</div>
+                  </div>
+                </label>
+
+                <label className="flex items-center gap-3 p-3 border rounded-lg cursor-pointer hover:bg-gray-50">
+                  <input
+                    type="checkbox"
+                    checked={genConfig.actifUniquement}
+                    onChange={(e) => setGenConfig(p => ({ ...p, actifUniquement: e.target.checked }))}
+                    className="w-5 h-5"
+                  />
+                  <div>
+                    <div className="font-medium">Entreprises actives uniquement</div>
+                    <div className="text-sm text-gray-500">Exclure les établissements fermés</div>
+                  </div>
+                </label>
+
+                <label className="flex items-center gap-3 p-3 border rounded-lg cursor-pointer hover:bg-gray-50">
+                  <input
+                    type="checkbox"
+                    checked={genConfig.siegeUniquement}
+                    onChange={(e) => setGenConfig(p => ({ ...p, siegeUniquement: e.target.checked }))}
+                    className="w-5 h-5"
+                  />
+                  <div>
+                    <div className="font-medium">Sièges sociaux uniquement</div>
+                    <div className="text-sm text-gray-500">Évite les doublons (succursales)</div>
+                  </div>
+                </label>
+              </div>
+
+              {/* Limite */}
+              <div className="space-y-4">
+                <h4 className="font-medium text-gray-700">📊 Quantité</h4>
+
+                <div>
+                  <label className="block text-sm font-medium mb-1">Nombre maximum de contacts</label>
+                  <select
+                    value={genConfig.limit}
+                    onChange={(e) => setGenConfig(p => ({ ...p, limit: parseInt(e.target.value) }))}
+                    className="w-full border rounded-lg px-4 py-2"
+                  >
+                    <option value={100}>100 contacts</option>
+                    <option value={250}>250 contacts</option>
+                    <option value={500}>500 contacts</option>
+                    <option value={1000}>1 000 contacts</option>
+                    <option value={2500}>2 500 contacts</option>
+                    <option value={5000}>5 000 contacts</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex gap-4 mt-6">
+              <Button onClick={generatePreview} loading={loading} variant="outline" icon={Eye} className="flex-1">
+                Aperçu
+              </Button>
+              <Button onClick={generateAndInject} loading={loading} variant="success" icon={Plus} className="flex-1">
+                Générer et injecter dans Contacts
+              </Button>
+            </div>
+          </Card>
+
+          {/* Résultat */}
+          {genResult && (
+            <Card className="p-6">
+              <h3 className="font-semibold mb-4 flex items-center gap-2">
+                <CheckCircle2 className="w-5 h-5 text-green-500" />
+                Résultat
+              </h3>
+              <div className="grid grid-cols-3 gap-4">
+                <div className="text-center p-4 bg-blue-50 rounded-lg">
+                  <div className="text-2xl font-bold text-blue-600">{genResult.found || genResult.total || 0}</div>
+                  <div className="text-sm">Entreprises trouvées</div>
+                </div>
+                {genResult.injected !== undefined && (
+                  <div className="text-center p-4 bg-green-50 rounded-lg">
+                    <div className="text-2xl font-bold text-green-600">{genResult.injected}</div>
+                    <div className="text-sm">Contacts injectés</div>
+                  </div>
+                )}
+              </div>
+            </Card>
+          )}
+
+          {/* Preview */}
+          {genPreview.length > 0 && (
+            <Card className="p-6">
+              <h3 className="font-semibold mb-4">Aperçu ({genPreview.length} premiers résultats)</h3>
+              <div className="overflow-x-auto">
+                <table className="min-w-full divide-y divide-gray-200">
+                  <thead className="bg-gray-50">
+                    <tr>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500">SIRET</th>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500">Enseigne</th>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500">CP / Ville</th>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500">NAF</th>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500">Effectif</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-200">
+                    {genPreview.map(row => (
+                      <tr key={row.siret}>
+                        <td className="px-4 py-2 text-sm font-mono">{row.siret}</td>
+                        <td className="px-4 py-2 text-sm font-medium">{row.enseigne_1 || row.denomination_usuelle || '-'}</td>
+                        <td className="px-4 py-2 text-sm">{row.code_postal} {row.libelle_commune}</td>
+                        <td className="px-4 py-2 text-sm">{row.activite_principale}</td>
+                        <td className="px-4 py-2 text-sm">{row.tranche_effectifs || '-'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+          )}
+        </div>
+      )}
+
+      {/* Tab: Search */}
+      {activeTab === 'search' && (
+        <div className="space-y-6">
+          <Card className="p-6">
+            <h3 className="font-semibold mb-4">Rechercher dans la base SIRENE</h3>
+
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-4">
+              <input
+                type="text"
+                value={searchParams.q}
+                onChange={(e) => setSearchParams(p => ({ ...p, q: e.target.value }))}
+                placeholder="Nom, enseigne..."
+                className="border rounded-lg px-4 py-2"
+              />
+              <input
+                type="text"
+                value={searchParams.siret}
+                onChange={(e) => setSearchParams(p => ({ ...p, siret: e.target.value }))}
+                placeholder="SIRET"
+                className="border rounded-lg px-4 py-2"
+              />
+              <input
+                type="text"
+                value={searchParams.cp}
+                onChange={(e) => setSearchParams(p => ({ ...p, cp: e.target.value }))}
+                placeholder="Code postal"
+                className="border rounded-lg px-4 py-2"
+              />
+              <input
+                type="text"
+                value={searchParams.departement}
+                onChange={(e) => setSearchParams(p => ({ ...p, departement: e.target.value }))}
+                placeholder="Département (59)"
+                className="border rounded-lg px-4 py-2"
+              />
+              <input
+                type="text"
+                value={searchParams.naf}
+                onChange={(e) => setSearchParams(p => ({ ...p, naf: e.target.value }))}
+                placeholder="Code NAF (56.10)"
+                className="border rounded-lg px-4 py-2"
+              />
+            </div>
+
+            <Button onClick={doSearch} loading={loading} icon={Search}>
+              Rechercher
+            </Button>
+          </Card>
+
+          {searchResults.total > 0 && (
+            <Card className="p-6">
+              <h3 className="font-semibold mb-4">{formatNumber(searchResults.total)} résultats</h3>
+              <div className="overflow-x-auto">
+                <table className="min-w-full divide-y divide-gray-200">
+                  <thead className="bg-gray-50">
+                    <tr>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500">SIRET</th>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500">Enseigne</th>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500">Adresse</th>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500">CP / Ville</th>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500">NAF</th>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500">État</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-200">
+                    {searchResults.data.map(row => (
+                      <tr key={row.siret} className="hover:bg-gray-50">
+                        <td className="px-4 py-2 text-sm font-mono">{row.siret}</td>
+                        <td className="px-4 py-2 text-sm font-medium">{row.enseigne_1 || row.denomination_usuelle || '-'}</td>
+                        <td className="px-4 py-2 text-sm">{[row.numero_voie, row.type_voie, row.libelle_voie].filter(Boolean).join(' ')}</td>
+                        <td className="px-4 py-2 text-sm">{row.code_postal} {row.libelle_commune}</td>
+                        <td className="px-4 py-2 text-sm">{row.activite_principale}</td>
+                        <td className="px-4 py-2">
+                          <Badge color={row.etat_administratif === 'A' ? 'green' : 'red'}>
+                            {row.etat_administratif === 'A' ? 'Actif' : 'Fermé'}
+                          </Badge>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ============================================
 // Main App
 // ============================================
 export default function App() {
@@ -1204,6 +2383,8 @@ export default function App() {
   const navItems = [
     { id: 'dashboard', label: 'Tableau de bord', icon: Home },
     { id: 'contacts', label: 'Contacts', icon: Users },
+    { id: 'stock', label: 'Stock Central', icon: Layers },
+    { id: 'sirene', label: 'Base SIRENE', icon: Database },
     { id: 'authorized-cp', label: 'CP Autorisés', icon: Shield },
     { id: 'enrichment', label: 'Enrichissement', icon: Zap },
     { id: 'import', label: 'Import', icon: Upload },
@@ -1234,6 +2415,8 @@ export default function App() {
       <main className="ml-64 p-8">
         {currentPage === 'dashboard' && <Dashboard stats={stats} enrichmentStatus={enrichmentStatus} onRefresh={loadData} />}
         {currentPage === 'contacts' && <ContactsList showToast={showToast} />}
+        {currentPage === 'stock' && <StockPage showToast={showToast} onUpdate={loadData} />}
+        {currentPage === 'sirene' && <SirenePage showToast={showToast} onUpdate={loadData} />}
         {currentPage === 'enrichment' && <EnrichmentPage onComplete={loadData} showToast={showToast} />}
         {currentPage === 'authorized-cp' && <AuthorizedCpPage showToast={showToast} onUpdate={loadData} />}
         {currentPage === 'import' && <ImportPage onImportComplete={loadData} showToast={showToast} />}

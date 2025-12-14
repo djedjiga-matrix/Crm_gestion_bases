@@ -196,6 +196,7 @@ router.post('/entreprise', async (req, res) => {
       SELECT id, nom, adresse, code_postal, ville
       FROM contacts
       WHERE ${whereClause}
+      ORDER BY id ASC
       LIMIT $1
     `, [limit]);
 
@@ -260,6 +261,7 @@ router.post('/geocode', async (req, res) => {
       SELECT id, adresse, code_postal, ville
       FROM contacts
       WHERE ${whereClause} AND code_postal IS NOT NULL
+      ORDER BY id ASC
       LIMIT $1
     `, [limit]);
 
@@ -347,6 +349,7 @@ router.post('/trajets', async (req, res) => {
       SELECT id, latitude, longitude
       FROM contacts
       WHERE ${whereClause}
+      ORDER BY id ASC
       LIMIT $1
     `, [limit]);
 
@@ -413,6 +416,7 @@ router.post('/all', async (req, res) => {
       SELECT id, nom, adresse, code_postal, ville, siret, latitude
       FROM contacts
       WHERE siret IS NULL OR latitude IS NULL OR duree_secondes IS NULL
+      ORDER BY id ASC
       LIMIT $1
     `, [limit]);
 

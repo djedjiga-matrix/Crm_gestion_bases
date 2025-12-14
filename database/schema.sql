@@ -655,4 +655,146 @@ SELECT
     COUNT(c.id) FILTER (WHERE c.status = 'nouveau') as nouveaux
 FROM activity_groups ag
 LEFT JOIN contacts c ON c.activity_group_id = ag.id
-GROUP BY ag.id, ag.code, ag.nom, ag.horaires_ok, ag.couleur;
+
+-- ============================================
+-- STOCK CENTRALISÉ
+-- ============================================
+
+CREATE TABLE stock_prospects (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    telephone VARCHAR(20) UNIQUE,
+    telephone_normalise VARCHAR(10) UNIQUE,
+    nom VARCHAR(255),
+    prenom VARCHAR(255),
+    email VARCHAR(255),
+    adresse TEXT,
+    code_postal VARCHAR(5),
+    ville VARCHAR(100),
+    siret VARCHAR(14),
+    entreprise VARCHAR(255),
+    
+    -- Enrichissement
+    latitude DECIMAL(10, 8),
+    longitude DECIMAL(11, 8),
+    distance_metres INTEGER,
+    statut_enrichissement VARCHAR(20) DEFAULT 'BRUT', -- BRUT, ENRICHI, COMPLET
+    
+    -- Méta-données
+    source_fichier VARCHAR(255),
+    metadata JSONB,
+    
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    enriched_at TIMESTAMP,
+    imported_at TIMESTAMP
+);
+
+CREATE INDEX idx_stock_tel_norm ON stock_prospects(telephone_normalise);
+CREATE INDEX idx_stock_siret ON stock_prospects(siret);
+CREATE INDEX idx_stock_statut ON stock_prospects(statut_enrichissement);
+
+-- Trigger pour normaliser le téléphone du stock
+CREATE OR REPLACE FUNCTION stock_before_save()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.telephone_normalise := normalize_phone(NEW.telephone);
+    NEW.updated_at := CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_stock_before_save
+
+-- ============================================
+-- SIRENE COMPLETE
+-- ============================================
+
+CREATE TABLE sirene_etablissements (
+    id SERIAL PRIMARY KEY,
+    siren VARCHAR(9),
+    nic VARCHAR(5),
+    siret VARCHAR(14) UNIQUE,
+    statut_diffusion VARCHAR(1),
+    date_creation DATE,
+    tranche_effectifs VARCHAR(2),
+    annee_effectifs INTEGER,
+    activite_principale_registre_metiers VARCHAR(6),
+    date_dernier_traitement TIMESTAMP,
+    etablissement_siege BOOLEAN,
+    nombre_periodes INTEGER,
+    complement_adresse VARCHAR(255),
+    numero_voie VARCHAR(10),
+    indice_repetition VARCHAR(10),
+    dernier_numero_voie VARCHAR(10),
+    indice_repetition_dernier VARCHAR(10),
+    type_voie VARCHAR(10),
+    libelle_voie VARCHAR(255),
+    code_postal VARCHAR(5),
+    libelle_commune VARCHAR(255),
+    libelle_commune_etranger VARCHAR(255),
+    distribution_speciale VARCHAR(255),
+    code_commune VARCHAR(5),
+    code_cedex VARCHAR(10),
+    libelle_cedex VARCHAR(255),
+    code_pays_etranger VARCHAR(10),
+    libelle_pays_etranger VARCHAR(255),
+    identifiant_adresse VARCHAR(50),
+    coordonnee_lambert_x DECIMAL(15,6),
+    coordonnee_lambert_y DECIMAL(15,6),
+    complement_adresse_2 VARCHAR(255),
+    numero_voie_2 VARCHAR(10),
+    indice_repetition_2 VARCHAR(10),
+    type_voie_2 VARCHAR(10),
+    libelle_voie_2 VARCHAR(255),
+    code_postal_2 VARCHAR(5),
+    libelle_commune_2 VARCHAR(255),
+    libelle_commune_etranger_2 VARCHAR(255),
+    distribution_speciale_2 VARCHAR(255),
+    code_commune_2 VARCHAR(5),
+    code_cedex_2 VARCHAR(10),
+    libelle_cedex_2 VARCHAR(255),
+    code_pays_etranger_2 VARCHAR(10),
+    libelle_pays_etranger_2 VARCHAR(255),
+    date_debut DATE,
+    etat_administratif VARCHAR(1),
+    enseigne_1 VARCHAR(255),
+    enseigne_2 VARCHAR(255),
+    enseigne_3 VARCHAR(255),
+    denomination_usuelle VARCHAR(255),
+    activite_principale VARCHAR(6),
+    nomenclature_activite VARCHAR(10),
+    caractere_employeur VARCHAR(1),
+    
+    -- Métadonnées
+    imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Index essentiels pour les recherches rapides
+CREATE INDEX idx_sirene_siret ON sirene_etablissements(siret);
+CREATE INDEX idx_sirene_siren ON sirene_etablissements(siren);
+CREATE INDEX idx_sirene_cp ON sirene_etablissements(code_postal);
+CREATE INDEX idx_sirene_commune ON sirene_etablissements(code_commune);
+CREATE INDEX idx_sirene_naf ON sirene_etablissements(activite_principale);
+CREATE INDEX idx_sirene_effectif ON sirene_etablissements(tranche_effectifs);
+CREATE INDEX idx_sirene_etat ON sirene_etablissements(etat_administratif);
+CREATE INDEX idx_sirene_siege ON sirene_etablissements(etablissement_siege);
+
+-- Index composite pour les recherches fréquentes
+CREATE INDEX idx_sirene_cp_naf_effectif ON sirene_etablissements(code_postal, activite_principale, tranche_effectifs);
+CREATE INDEX idx_sirene_cp_etat ON sirene_etablissements(code_postal, etat_administratif);
+
+-- Table pour suivre les imports SIRENE
+CREATE TABLE sirene_imports (
+    id SERIAL PRIMARY KEY,
+    filename VARCHAR(255) NOT NULL,
+    file_date DATE,
+    total_rows BIGINT,
+    imported_rows BIGINT,
+    updated_rows BIGINT,
+    errors INTEGER DEFAULT 0,
+    status VARCHAR(20) DEFAULT 'pending', -- pending, running, completed, failed
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);

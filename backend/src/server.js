@@ -13,6 +13,8 @@ const referenceRouter = require('./routes/reference');
 const statsRouter = require('./routes/stats');
 const enrichmentRouter = require('./routes/enrichment');
 const authorizedCpRouter = require('./routes/authorized-cp');
+const stockRouter = require('./routes/stock');
+const sireneRouter = require('./routes/sirene');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -41,6 +43,8 @@ app.use('/api/reference', referenceRouter);
 app.use('/api/stats', statsRouter);
 app.use('/api/enrichment', enrichmentRouter);
 app.use('/api/authorized-cp', upload.single('file'), authorizedCpRouter);
+app.use('/api/stock', stockRouter);
+app.use('/api/sirene', sireneRouter);
 
 // Health check
 app.get('/api/health', (req, res) => {
