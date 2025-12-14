@@ -4,13 +4,13 @@ WORKDIR /app
 
 # Install dependencies
 COPY package*.json ./
-RUN npm ci --only=production
+RUN npm install --production
 
 # Copy source
 COPY . .
 
-# Expose port
+# Environment variables should be passed by docker-compose, 
+# but we expose the port
 EXPOSE 3001
 
-# Start server
-CMD ["node", "src/server.js"]
+CMD ["npm", "start"]
